@@ -1,0 +1,11 @@
+go_import_path: github.com/catamat/config
+
+language: go
+
+go:
+  - 1.16.x
+  - tip
+
+os:
+  - linux
+  - osx
