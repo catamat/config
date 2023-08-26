@@ -3,7 +3,6 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strconv"
@@ -12,7 +11,7 @@ import (
 
 // FromJSON loads the JSON configuration file from the path and tries to convert it into a structure.
 func FromJSON(structure interface{}, path string) error {
-	file, err := ioutil.ReadFile(path)
+	file, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
@@ -42,7 +41,9 @@ func FromEnv(structure interface{}) error {
 
 		if key != "" && value != "" {
 			if structure != nil {
-				populateStruct(structure, key, value)
+				if err := populateStruct(structure, key, value); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -62,7 +63,9 @@ func FromFlags(structure interface{}) error {
 
 		if key != "" && value != "" {
 			if structure != nil {
-				populateStruct(structure, key, value)
+				if err := populateStruct(structure, key, value); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -71,7 +74,7 @@ func FromFlags(structure interface{}) error {
 }
 
 // populateStruct tries to populate the input structure using the key and value strings.
-func populateStruct(structure interface{}, dataKey string, dataValue string) {
+func populateStruct(structure interface{}, dataKey string, dataValue string) error {
 	structElem := reflect.ValueOf(structure).Elem()
 
 	for i := 0; i < structElem.NumField(); i++ {
@@ -100,16 +103,22 @@ func populateStruct(structure interface{}, dataKey string, dataValue string) {
 					valueSep = fieldType.Tag.Get("vsep")
 				}
 
-				populateSlice(elemPtr, dataValue, valueSep)
+				if err := populateSlice(elemPtr, dataValue, valueSep); err != nil {
+					return err
+				}
 			default:
-				populateField(elemPtr, dataValue)
+				if err := populateField(elemPtr, dataValue); err != nil {
+					return err
+				}
 			}
 		}
 	}
+
+	return nil
 }
 
 // populateSlice splits sliceValue by valueSep and tries to populate the input slice.
-func populateSlice(slicePtr interface{}, sliceValue string, valueSep string) {
+func populateSlice(slicePtr interface{}, sliceValue string, valueSep string) error {
 	slice := reflect.ValueOf(slicePtr).Elem()
 	sliceType := slice.Type().Elem()
 
@@ -117,60 +126,83 @@ func populateSlice(slicePtr interface{}, sliceValue string, valueSep string) {
 
 	for _, part := range parts {
 		fieldPtr := reflect.New(sliceType)
-		populateField(fieldPtr.Interface(), part)
+		if err := populateField(fieldPtr.Interface(), part); err != nil {
+			return err
+		}
+
 		slice.Set(reflect.Append(slice, fieldPtr.Elem()))
 	}
+
+	return nil
 }
 
 // populateField tries to populate the input field.
-func populateField(fieldPtr interface{}, fieldValue string) {
+func populateField(fieldPtr interface{}, fieldValue string) error {
 	field := reflect.ValueOf(fieldPtr).Elem()
 
-	if field.IsValid() && field.CanSet() {
-		switch field.Kind() {
-		case reflect.String:
-			field.SetString(fieldValue)
-		case reflect.Int:
-			r, _ := strconv.ParseInt(fieldValue, 10, 0)
-			field.SetInt(r)
-		case reflect.Int8:
-			r, _ := strconv.ParseInt(fieldValue, 10, 8)
-			field.SetInt(r)
-		case reflect.Int16:
-			r, _ := strconv.ParseInt(fieldValue, 10, 16)
-			field.SetInt(r)
-		case reflect.Int32:
-			r, _ := strconv.ParseInt(fieldValue, 10, 32)
-			field.SetInt(r)
-		case reflect.Int64:
-			r, _ := strconv.ParseInt(fieldValue, 10, 64)
-			field.SetInt(r)
-		case reflect.Uint:
-			r, _ := strconv.ParseUint(fieldValue, 10, 0)
-			field.SetUint(r)
-		case reflect.Uint8:
-			r, _ := strconv.ParseUint(fieldValue, 10, 8)
-			field.SetUint(r)
-		case reflect.Uint16:
-			r, _ := strconv.ParseUint(fieldValue, 10, 16)
-			field.SetUint(r)
-		case reflect.Uint32:
-			r, _ := strconv.ParseUint(fieldValue, 10, 32)
-			field.SetUint(r)
-		case reflect.Uint64:
-			r, _ := strconv.ParseUint(fieldValue, 10, 64)
-			field.SetUint(r)
-		case reflect.Bool:
-			r, _ := strconv.ParseBool(fieldValue)
-			field.SetBool(r)
-		case reflect.Float32:
-			r, _ := strconv.ParseFloat(fieldValue, 32)
-			field.SetFloat(r)
-		case reflect.Float64:
-			r, _ := strconv.ParseFloat(fieldValue, 64)
-			field.SetFloat(r)
-		default:
-			panic(fmt.Sprintf("cannot handle field kind: %v", field.Type().Kind()))
-		}
+	if !field.IsValid() {
+		return fmt.Errorf("field is not valid")
 	}
+	if !field.CanSet() {
+		return fmt.Errorf("field cannot be set")
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		field.SetString(fieldValue)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		bitSize := 0
+		switch field.Kind() {
+		case reflect.Int8:
+			bitSize = 8
+		case reflect.Int16:
+			bitSize = 16
+		case reflect.Int32:
+			bitSize = 32
+		case reflect.Int64:
+			bitSize = 64
+		}
+		r, err := strconv.ParseInt(fieldValue, 10, bitSize)
+		if err != nil {
+			return fmt.Errorf("failed to parse %s as int: %v", fieldValue, err)
+		}
+		field.SetInt(r)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		bitSize := 0
+		switch field.Kind() {
+		case reflect.Uint8:
+			bitSize = 8
+		case reflect.Uint16:
+			bitSize = 16
+		case reflect.Uint32:
+			bitSize = 32
+		case reflect.Uint64:
+			bitSize = 64
+		}
+		r, err := strconv.ParseUint(fieldValue, 10, bitSize)
+		if err != nil {
+			return fmt.Errorf("failed to parse %s as uint: %v", fieldValue, err)
+		}
+		field.SetUint(r)
+	case reflect.Bool:
+		r, err := strconv.ParseBool(fieldValue)
+		if err != nil {
+			return fmt.Errorf("failed to parse %s as bool: %v", fieldValue, err)
+		}
+		field.SetBool(r)
+	case reflect.Float32, reflect.Float64:
+		bitSize := 32
+		if field.Kind() == reflect.Float64 {
+			bitSize = 64
+		}
+		r, err := strconv.ParseFloat(fieldValue, bitSize)
+		if err != nil {
+			return fmt.Errorf("failed to parse %s as float: %v", fieldValue, err)
+		}
+		field.SetFloat(r)
+	default:
+		return fmt.Errorf("cannot handle field kind: %v", field.Type().Kind())
+	}
+
+	return nil
 }
