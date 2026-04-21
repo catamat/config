@@ -13,6 +13,10 @@ If an `env` or `flag` tag is omitted, the exported Go field name is used as fall
 `FromFlags` uses the standard library `flag` parser. Flag tags can be written with or without a leading `-`.
 Repeated flags do not append to slices: the last provided flag value wins.
 
+`FromJSON` can also transparently protect tagged string fields, pointers to string, and slices/arrays of strings with `WithJSONSecrets`.
+Fields tagged with `secret:"true"` are exposed in plaintext in memory, but if the JSON file still contains plaintext values the package rewrites it using AES-GCM and a passphrase-derived key.
+This is useful to hide secrets from casual inspection, but it is not a replacement for a dedicated secret manager.
+
 ## Installation:
 ```
 go get github.com/catamat/config@latest
@@ -88,5 +92,54 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println(cfg3)
+}
+```
+
+## JSON secret fields
+```golang
+package main
+
+import (
+	"log"
+	"os"
+
+	"github.com/catamat/config"
+)
+
+type cfg struct {
+	DBHost     string `json:"db_host"`
+	DBUser     string `json:"db_user"`
+	DBPassword string `json:"db_password" secret:"true"`
+}
+
+func main() {
+	var conf cfg
+	if err := config.FromJSON(
+		&conf,
+		"config.json",
+		config.WithJSONSecrets([]byte(os.Getenv("SECRET_PASSPHRASE"))),
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println(conf.DBHost, conf.DBUser, conf.DBPassword)
+}
+```
+
+On the first load, a plaintext file like:
+```json
+{
+  "db_host": "localhost",
+  "db_user": "app",
+  "db_password": "super-secret"
+}
+```
+
+is rewritten automatically to something like:
+```json
+{
+  "db_host": "localhost",
+  "db_user": "app",
+  "db_password": "enc:v1:..."
 }
 ```

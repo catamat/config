@@ -1,7 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +16,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+
+	"github.com/catamat/secure"
 )
 
 type valueSource string
@@ -18,6 +25,11 @@ type valueSource string
 const (
 	sourceEnv  valueSource = "env"
 	sourceFlag valueSource = "flag"
+)
+
+const (
+	jsonSecretTag    = "secret"
+	jsonSecretPrefix = "enc:v1:"
 )
 
 var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
@@ -34,9 +46,36 @@ type flagFieldValue struct {
 	seen      bool
 }
 
+// JSONOption configures the behavior of FromJSON.
+type JSONOption func(*jsonOptions) error
+
+type jsonOptions struct {
+	secretPassphrase []byte
+}
+
+// WithJSONSecrets enables transparent encryption for JSON fields tagged with `secret:"true"`.
+//
+// Tagged string values are returned in plaintext in memory. If the file still contains plaintext,
+// it is automatically rewritten using AES-GCM with the passphrase-derived key.
+func WithJSONSecrets(passphrase []byte) JSONOption {
+	return func(options *jsonOptions) error {
+		if len(passphrase) == 0 {
+			return errors.New("config: JSON secret passphrase cannot be empty")
+		}
+
+		options.secretPassphrase = append([]byte(nil), passphrase...)
+		return nil
+	}
+}
+
 // FromJSON loads the JSON configuration file from the path and tries to convert it into a structure.
-func FromJSON(structure interface{}, path string) error {
+func FromJSON(structure interface{}, path string, options ...JSONOption) error {
 	if err := validatePointerTarget(structure); err != nil {
+		return err
+	}
+
+	jsonOptions, err := buildJSONOptions(options)
+	if err != nil {
 		return err
 	}
 
@@ -50,7 +89,33 @@ func FromJSON(structure interface{}, path string) error {
 		return nil
 	}
 
-	return json.Unmarshal(file, structure)
+	if err := json.Unmarshal(file, structure); err != nil {
+		return err
+	}
+
+	if len(jsonOptions.secretPassphrase) == 0 {
+		return nil
+	}
+
+	structElem, err := validateStructTarget(structure)
+	if err != nil {
+		return err
+	}
+
+	updated, err := revealJSONSecrets(structElem, jsonOptions.secretPassphrase, "")
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return nil
+	}
+
+	data, err := marshalEncryptedJSON(structure, jsonOptions.secretPassphrase)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, normalizeJSONLineEndings(data, file), 0o600)
 }
 
 // FromEnv loads the configuration vars from the environment and tries to convert them into a structure.
@@ -677,4 +742,380 @@ func populateField(field reflect.Value, fieldValue string) error {
 	}
 
 	return nil
+}
+
+func buildJSONOptions(options []JSONOption) (jsonOptions, error) {
+	var result jsonOptions
+
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(&result); err != nil {
+			return jsonOptions{}, err
+		}
+	}
+
+	return result, nil
+}
+
+func revealJSONSecrets(value reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if !value.IsValid() {
+		return false, nil
+	}
+
+	switch value.Kind() {
+	case reflect.Pointer:
+		if value.IsNil() {
+			return false, nil
+		}
+
+		return revealJSONSecrets(value.Elem(), secretPassphrase, path)
+	case reflect.Struct:
+		return revealStructJSONSecrets(value, secretPassphrase, path)
+	default:
+		return false, nil
+	}
+}
+
+func revealStructJSONSecrets(structElem reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	var updated bool
+
+	for i := 0; i < structElem.NumField(); i++ {
+		fieldType := structElem.Type().Field(i)
+		if !fieldType.IsExported() {
+			continue
+		}
+
+		fieldPath := joinFieldPath(path, fieldType.Name)
+		field := structElem.Field(i)
+
+		if hasJSONSecretTag(fieldType) {
+			fieldUpdated, err := revealJSONSecretValue(field, secretPassphrase, fieldPath)
+			if err != nil {
+				return false, err
+			}
+
+			updated = updated || fieldUpdated
+		}
+
+		nestedUpdated, err := revealNestedJSONSecrets(field, secretPassphrase, fieldPath)
+		if err != nil {
+			return false, err
+		}
+
+		updated = updated || nestedUpdated
+	}
+
+	return updated, nil
+}
+
+func revealNestedJSONSecrets(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if supportsTextUnmarshaler(field) {
+		return false, nil
+	}
+
+	switch field.Kind() {
+	case reflect.Struct:
+		return revealStructJSONSecrets(field, secretPassphrase, path)
+	case reflect.Pointer:
+		if field.IsNil() {
+			return false, nil
+		}
+		if field.Type().Elem().Kind() != reflect.Struct || field.Type().Implements(textUnmarshalerType) {
+			return false, nil
+		}
+
+		return revealStructJSONSecrets(field.Elem(), secretPassphrase, path)
+	default:
+		return false, nil
+	}
+}
+
+func hasJSONSecretTag(fieldType reflect.StructField) bool {
+	tagValue, ok := fieldType.Tag.Lookup(jsonSecretTag)
+	if !ok {
+		return false
+	}
+
+	tagValue = strings.TrimSpace(tagValue)
+	if tagValue == "-" {
+		return false
+	}
+
+	return tagValue == "" ||
+		tagValue == "1" ||
+		strings.EqualFold(tagValue, "true") ||
+		strings.EqualFold(tagValue, "yes")
+}
+
+func revealJSONSecretValue(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if !field.IsValid() {
+		return false, nil
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		return revealJSONStringSecret(field, secretPassphrase, path)
+	case reflect.Pointer:
+		if field.IsNil() {
+			return false, nil
+		}
+		if field.Type().Elem().Kind() == reflect.Struct {
+			return false, fmt.Errorf("config: field %s: secret tag is not supported on %s", path, field.Type())
+		}
+
+		return revealJSONSecretValue(field.Elem(), secretPassphrase, path)
+	case reflect.Slice, reflect.Array:
+		var updated bool
+
+		for i := 0; i < field.Len(); i++ {
+			itemPath := fmt.Sprintf("%s[%d]", path, i)
+			itemUpdated, err := revealJSONSecretValue(field.Index(i), secretPassphrase, itemPath)
+			if err != nil {
+				return false, err
+			}
+
+			updated = updated || itemUpdated
+		}
+
+		return updated, nil
+	default:
+		return false, fmt.Errorf("config: field %s: secret tag is only supported on string values, pointers to string, or slices/arrays of them", path)
+	}
+}
+
+func revealJSONStringSecret(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	value := field.String()
+	if value == "" {
+		return false, nil
+	}
+
+	plaintext, encrypted, rewrite, err := decryptJSONSecret(value, secretPassphrase)
+	if err != nil {
+		return false, fmt.Errorf("config: field %s: %w", path, err)
+	}
+	if !encrypted {
+		return true, nil
+	}
+
+	field.SetString(plaintext)
+	return rewrite, nil
+}
+
+func marshalEncryptedJSON(structure interface{}, secretPassphrase []byte) ([]byte, error) {
+	clone, err := cloneJSONStructure(structure)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := encryptJSONSecrets(reflect.ValueOf(clone).Elem(), secretPassphrase, ""); err != nil {
+		return nil, err
+	}
+
+	return json.MarshalIndent(clone, "", "  ")
+}
+
+func cloneJSONStructure(structure interface{}) (interface{}, error) {
+	data, err := json.Marshal(structure)
+	if err != nil {
+		return nil, err
+	}
+
+	clone := reflect.New(reflect.TypeOf(structure).Elem())
+	if err := json.Unmarshal(data, clone.Interface()); err != nil {
+		return nil, err
+	}
+
+	return clone.Interface(), nil
+}
+
+func encryptJSONSecrets(value reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if !value.IsValid() {
+		return false, nil
+	}
+
+	switch value.Kind() {
+	case reflect.Pointer:
+		if value.IsNil() {
+			return false, nil
+		}
+
+		return encryptJSONSecrets(value.Elem(), secretPassphrase, path)
+	case reflect.Struct:
+		return encryptStructJSONSecrets(value, secretPassphrase, path)
+	default:
+		return false, nil
+	}
+}
+
+func encryptStructJSONSecrets(structElem reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	var updated bool
+
+	for i := 0; i < structElem.NumField(); i++ {
+		fieldType := structElem.Type().Field(i)
+		if !fieldType.IsExported() {
+			continue
+		}
+
+		fieldPath := joinFieldPath(path, fieldType.Name)
+		field := structElem.Field(i)
+
+		if hasJSONSecretTag(fieldType) {
+			fieldUpdated, err := encryptJSONSecretValue(field, secretPassphrase, fieldPath)
+			if err != nil {
+				return false, err
+			}
+
+			updated = updated || fieldUpdated
+		}
+
+		nestedUpdated, err := encryptNestedJSONSecrets(field, secretPassphrase, fieldPath)
+		if err != nil {
+			return false, err
+		}
+
+		updated = updated || nestedUpdated
+	}
+
+	return updated, nil
+}
+
+func encryptNestedJSONSecrets(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if supportsTextUnmarshaler(field) {
+		return false, nil
+	}
+
+	switch field.Kind() {
+	case reflect.Struct:
+		return encryptStructJSONSecrets(field, secretPassphrase, path)
+	case reflect.Pointer:
+		if field.IsNil() {
+			return false, nil
+		}
+		if field.Type().Elem().Kind() != reflect.Struct || field.Type().Implements(textUnmarshalerType) {
+			return false, nil
+		}
+
+		return encryptStructJSONSecrets(field.Elem(), secretPassphrase, path)
+	default:
+		return false, nil
+	}
+}
+
+func encryptJSONSecretValue(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	if !field.IsValid() {
+		return false, nil
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		return encryptJSONStringSecret(field, secretPassphrase, path)
+	case reflect.Pointer:
+		if field.IsNil() {
+			return false, nil
+		}
+		if field.Type().Elem().Kind() == reflect.Struct {
+			return false, fmt.Errorf("config: field %s: secret tag is not supported on %s", path, field.Type())
+		}
+
+		return encryptJSONSecretValue(field.Elem(), secretPassphrase, path)
+	case reflect.Slice, reflect.Array:
+		var updated bool
+
+		for i := 0; i < field.Len(); i++ {
+			itemPath := fmt.Sprintf("%s[%d]", path, i)
+			itemUpdated, err := encryptJSONSecretValue(field.Index(i), secretPassphrase, itemPath)
+			if err != nil {
+				return false, err
+			}
+
+			updated = updated || itemUpdated
+		}
+
+		return updated, nil
+	default:
+		return false, fmt.Errorf("config: field %s: secret tag is only supported on string values, pointers to string, or slices/arrays of them", path)
+	}
+}
+
+func encryptJSONStringSecret(field reflect.Value, secretPassphrase []byte, path string) (bool, error) {
+	value := field.String()
+	if value == "" {
+		return false, nil
+	}
+
+	encryptedValue, err := encryptJSONSecret(value, secretPassphrase)
+	if err != nil {
+		return false, fmt.Errorf("config: field %s: %w", path, err)
+	}
+
+	field.SetString(encryptedValue)
+	return true, nil
+}
+
+func encryptJSONSecret(value string, secretPassphrase []byte) (string, error) {
+	encryptedValue, err := secure.AESEncryptWithGCM([]byte(value), secretPassphrase)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt secret: %w", err)
+	}
+
+	return jsonSecretPrefix + string(encryptedValue), nil
+}
+
+func decryptJSONSecret(value string, secretPassphrase []byte) (string, bool, bool, error) {
+	if !strings.HasPrefix(value, jsonSecretPrefix) {
+		return value, false, false, nil
+	}
+
+	plaintext, err := secure.AESDecryptWithGCM([]byte(strings.TrimPrefix(value, jsonSecretPrefix)), secretPassphrase)
+	if err == nil {
+		return string(plaintext), true, false, nil
+	}
+
+	legacyPlaintext, legacyErr := decryptLegacyJSONSecret(strings.TrimPrefix(value, jsonSecretPrefix), secretPassphrase)
+	if legacyErr == nil {
+		return legacyPlaintext, true, true, nil
+	}
+
+	return "", true, false, fmt.Errorf("failed to decrypt secret: %w", err)
+}
+
+func normalizeJSONLineEndings(data []byte, original []byte) []byte {
+	if bytes.Contains(original, []byte("\r\n")) {
+		return bytes.ReplaceAll(data, []byte("\n"), []byte("\r\n"))
+	}
+
+	return data
+}
+
+func decryptLegacyJSONSecret(value string, secretPassphrase []byte) (string, error) {
+	sum := sha256.Sum256(secretPassphrase)
+
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	payload, err := base64.RawStdEncoding.DecodeString(value)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) < gcm.NonceSize() {
+		return "", errors.New("invalid legacy secret payload")
+	}
+
+	nonce := payload[:gcm.NonceSize()]
+	ciphertext := payload[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plaintext), nil
 }

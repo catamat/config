@@ -2,6 +2,12 @@ package config
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +33,29 @@ func (v *textValue) UnmarshalText(text []byte) error {
 	return nil
 }
 
+func encryptLegacyJSONSecretForTest(value string, passphrase []byte) (string, error) {
+	sum := sha256.Sum256(passphrase)
+
+	block, err := aes.NewCipher(sum[:])
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, []byte(value), nil)
+	payload := append(append([]byte(nil), nonce...), ciphertext...)
+	return jsonSecretPrefix + base64.RawStdEncoding.EncodeToString(payload), nil
+}
+
 func TestFromJSONRawBytes(t *testing.T) {
 	t.Parallel()
 
@@ -43,6 +72,194 @@ func TestFromJSONRawBytes(t *testing.T) {
 
 	if !bytes.Equal(raw, want) {
 		t.Fatalf("unexpected raw bytes: got %q want %q", raw, want)
+	}
+}
+
+func TestFromJSONSecretsRewritePlaintextFields(t *testing.T) {
+	t.Parallel()
+
+	type database struct {
+		User     string `json:"user"`
+		Password string `json:"password" secret:"true"`
+	}
+	type cfg struct {
+		Name     string   `json:"name"`
+		DB       database `json:"db"`
+		APIKeys  []string `json:"api_keys" secret:"true"`
+		Optional *string  `json:"optional" secret:"true"`
+	}
+
+	secret := "token-123"
+	path := filepath.Join(t.TempDir(), "config.json")
+	input := []byte(`{
+  "name": "demo",
+  "db": {
+    "user": "postgres",
+    "password": "super-secret"
+  },
+  "api_keys": ["one", "two"],
+  "optional": "token-123"
+}`)
+	if err := os.WriteFile(path, input, 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	var got cfg
+	if err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase"))); err != nil {
+		t.Fatalf("FromJSON returned error: %v", err)
+	}
+
+	if got.DB.Password != "super-secret" {
+		t.Fatalf("unexpected decrypted password: %q", got.DB.Password)
+	}
+	if len(got.APIKeys) != 2 || got.APIKeys[0] != "one" || got.APIKeys[1] != "two" {
+		t.Fatalf("unexpected api keys: %#v", got.APIKeys)
+	}
+	if got.Optional == nil || *got.Optional != secret {
+		t.Fatalf("unexpected optional secret: %#v", got.Optional)
+	}
+
+	rewritten, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rewritten file: %v", err)
+	}
+	if bytes.Contains(rewritten, []byte("super-secret")) {
+		t.Fatalf("plaintext password leaked to file: %s", rewritten)
+	}
+	if bytes.Contains(rewritten, []byte(`"one"`)) || bytes.Contains(rewritten, []byte(`"two"`)) {
+		t.Fatalf("plaintext api keys leaked to file: %s", rewritten)
+	}
+	if bytes.Contains(rewritten, []byte(secret)) {
+		t.Fatalf("plaintext optional secret leaked to file: %s", rewritten)
+	}
+	if !bytes.Contains(rewritten, []byte(jsonSecretPrefix)) {
+		t.Fatalf("expected encrypted values in file: %s", rewritten)
+	}
+}
+
+func TestFromJSONSecretsDecryptsWithoutRewritingEncryptedFile(t *testing.T) {
+	t.Parallel()
+
+	type cfg struct {
+		Password string `json:"password" secret:"true"`
+	}
+
+	encrypted, err := encryptJSONSecret("super-secret", []byte("passphrase"))
+	if err != nil {
+		t.Fatalf("encryptJSONSecret returned error: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	input, err := json.MarshalIndent(cfg{Password: encrypted}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, input, 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	var got cfg
+	if err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase"))); err != nil {
+		t.Fatalf("FromJSON returned error: %v", err)
+	}
+
+	if got.Password != "super-secret" {
+		t.Fatalf("unexpected decrypted password: %q", got.Password)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config file: %v", err)
+	}
+	if !bytes.Equal(after, input) {
+		t.Fatalf("expected encrypted file to stay unchanged\nbefore: %s\nafter:  %s", input, after)
+	}
+}
+
+func TestFromJSONSecretsRejectInvalidEncryptedValue(t *testing.T) {
+	t.Parallel()
+
+	type cfg struct {
+		Password string `json:"password" secret:"true"`
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	input := []byte(`{"password":"enc:v1:not-base64"}`)
+	if err := os.WriteFile(path, input, 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	var got cfg
+	err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase")))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "Password") {
+		t.Fatalf("expected field path in error, got: %v", err)
+	}
+}
+
+func TestFromJSONSecretsMigratesLegacyEncryptedValue(t *testing.T) {
+	t.Parallel()
+
+	type cfg struct {
+		Password string `json:"password" secret:"true"`
+	}
+
+	legacyEncrypted, err := encryptLegacyJSONSecretForTest("super-secret", []byte("passphrase"))
+	if err != nil {
+		t.Fatalf("encryptLegacyJSONSecretForTest returned error: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	input, err := json.MarshalIndent(cfg{Password: legacyEncrypted}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, input, 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	var got cfg
+	if err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase"))); err != nil {
+		t.Fatalf("FromJSON returned error: %v", err)
+	}
+
+	if got.Password != "super-secret" {
+		t.Fatalf("unexpected decrypted password: %q", got.Password)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config file: %v", err)
+	}
+	if bytes.Equal(after, input) {
+		t.Fatalf("expected legacy encrypted file to be rewritten")
+	}
+	if !bytes.Contains(after, []byte(jsonSecretPrefix)) {
+		t.Fatalf("expected encrypted value after migration: %s", after)
+	}
+}
+
+func TestFromJSONSecretsRejectUnsupportedFieldType(t *testing.T) {
+	t.Parallel()
+
+	type cfg struct {
+		Port int `json:"port" secret:"true"`
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"port":1234}`), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	var got cfg
+	err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase")))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "secret tag is only supported") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
