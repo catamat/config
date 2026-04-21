@@ -19,7 +19,7 @@ This is useful to hide secrets from casual inspection, but it is not a replaceme
 
 ## Installation:
 ```
-go get github.com/catamat/config@latest
+go install github.com/catamat/config@latest
 ```
 ## Example:
 ```golang
