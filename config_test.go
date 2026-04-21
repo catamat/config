@@ -2,11 +2,6 @@ package config
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -31,29 +26,6 @@ type textValue struct {
 func (v *textValue) UnmarshalText(text []byte) error {
 	v.Value = strings.ToUpper(string(text))
 	return nil
-}
-
-func encryptLegacyJSONSecretForTest(value string, passphrase []byte) (string, error) {
-	sum := sha256.Sum256(passphrase)
-
-	block, err := aes.NewCipher(sum[:])
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-
-	ciphertext := gcm.Seal(nil, nonce, []byte(value), nil)
-	payload := append(append([]byte(nil), nonce...), ciphertext...)
-	return jsonSecretPrefix + base64.RawStdEncoding.EncodeToString(payload), nil
 }
 
 func TestFromJSONRawBytes(t *testing.T) {
@@ -196,48 +168,6 @@ func TestFromJSONSecretsRejectInvalidEncryptedValue(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Password") {
 		t.Fatalf("expected field path in error, got: %v", err)
-	}
-}
-
-func TestFromJSONSecretsMigratesLegacyEncryptedValue(t *testing.T) {
-	t.Parallel()
-
-	type cfg struct {
-		Password string `json:"password" secret:"true"`
-	}
-
-	legacyEncrypted, err := encryptLegacyJSONSecretForTest("super-secret", []byte("passphrase"))
-	if err != nil {
-		t.Fatalf("encryptLegacyJSONSecretForTest returned error: %v", err)
-	}
-
-	path := filepath.Join(t.TempDir(), "config.json")
-	input, err := json.MarshalIndent(cfg{Password: legacyEncrypted}, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal config: %v", err)
-	}
-	if err := os.WriteFile(path, input, 0o600); err != nil {
-		t.Fatalf("write config file: %v", err)
-	}
-
-	var got cfg
-	if err := FromJSON(&got, path, WithJSONSecrets([]byte("passphrase"))); err != nil {
-		t.Fatalf("FromJSON returned error: %v", err)
-	}
-
-	if got.Password != "super-secret" {
-		t.Fatalf("unexpected decrypted password: %q", got.Password)
-	}
-
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read config file: %v", err)
-	}
-	if bytes.Equal(after, input) {
-		t.Fatalf("expected legacy encrypted file to be rewritten")
-	}
-	if !bytes.Contains(after, []byte(jsonSecretPrefix)) {
-		t.Fatalf("expected encrypted value after migration: %s", after)
 	}
 }
 

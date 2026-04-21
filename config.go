@@ -2,11 +2,7 @@ package config
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/sha256"
 	"encoding"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -891,7 +887,7 @@ func revealJSONStringSecret(field reflect.Value, secretPassphrase []byte, path s
 		return false, nil
 	}
 
-	plaintext, encrypted, rewrite, err := decryptJSONSecret(value, secretPassphrase)
+	plaintext, encrypted, err := decryptJSONSecret(value, secretPassphrase)
 	if err != nil {
 		return false, fmt.Errorf("config: field %s: %w", path, err)
 	}
@@ -900,7 +896,7 @@ func revealJSONStringSecret(field reflect.Value, secretPassphrase []byte, path s
 	}
 
 	field.SetString(plaintext)
-	return rewrite, nil
+	return false, nil
 }
 
 func marshalEncryptedJSON(structure interface{}, secretPassphrase []byte) ([]byte, error) {
@@ -1063,22 +1059,17 @@ func encryptJSONSecret(value string, secretPassphrase []byte) (string, error) {
 	return jsonSecretPrefix + string(encryptedValue), nil
 }
 
-func decryptJSONSecret(value string, secretPassphrase []byte) (string, bool, bool, error) {
+func decryptJSONSecret(value string, secretPassphrase []byte) (string, bool, error) {
 	if !strings.HasPrefix(value, jsonSecretPrefix) {
-		return value, false, false, nil
+		return value, false, nil
 	}
 
 	plaintext, err := secure.AESDecryptWithGCM([]byte(strings.TrimPrefix(value, jsonSecretPrefix)), secretPassphrase)
-	if err == nil {
-		return string(plaintext), true, false, nil
+	if err != nil {
+		return "", true, fmt.Errorf("failed to decrypt secret: %w", err)
 	}
 
-	legacyPlaintext, legacyErr := decryptLegacyJSONSecret(strings.TrimPrefix(value, jsonSecretPrefix), secretPassphrase)
-	if legacyErr == nil {
-		return legacyPlaintext, true, true, nil
-	}
-
-	return "", true, false, fmt.Errorf("failed to decrypt secret: %w", err)
+	return string(plaintext), true, nil
 }
 
 func normalizeJSONLineEndings(data []byte, original []byte) []byte {
@@ -1087,35 +1078,4 @@ func normalizeJSONLineEndings(data []byte, original []byte) []byte {
 	}
 
 	return data
-}
-
-func decryptLegacyJSONSecret(value string, secretPassphrase []byte) (string, error) {
-	sum := sha256.Sum256(secretPassphrase)
-
-	block, err := aes.NewCipher(sum[:])
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	payload, err := base64.RawStdEncoding.DecodeString(value)
-	if err != nil {
-		return "", err
-	}
-	if len(payload) < gcm.NonceSize() {
-		return "", errors.New("invalid legacy secret payload")
-	}
-
-	nonce := payload[:gcm.NonceSize()]
-	ciphertext := payload[gcm.NonceSize():]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", err
-	}
-
-	return string(plaintext), nil
 }
